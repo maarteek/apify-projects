@@ -1,88 +1,105 @@
 const Apify = require('apify');
-const { log } = Apify.utils;
+const { puppeteer } = require('puppeteer-extra');
+const { DEFAULT_PROXY_GROUP_NAME } = require('apify/consts');
 
 Apify.main(async () => {
     const input = await Apify.getInput();
     const {
-        searchQuery = '',
+        searchQuery = 'apartments in London',
         maxListings = 50,
         includeDetails = true,
         proxy = { useApifyProxy: true },
     } = input;
 
+    // Set up proxy configuration
+    const proxyConfiguration = await Apify.createProxyConfiguration({
+        groups: [
+            {
+                useApifyProxy: proxy.useApifyProxy,
+                apifyProxyGroups: [DEFAULT_PROXY_GROUP_NAME],
+            },
+        ],
+    });
+
+    // Create a RequestQueue to store URLs to crawl
     const requestQueue = await Apify.openRequestQueue();
-    const requestList = await Apify.openRequestList('start-urls', [
-        `https://www.example.com/search?query=${encodeURIComponent(searchQuery)}`,
-    ]);
+    await requestQueue.addRequest({ url: `https://www.example.com/search?q=${encodeURIComponent(searchQuery)}` });
 
-    const proxyConfiguration = await Apify.createProxyConfiguration(proxy);
+    // Create a dataset to store the scraped results
+    const dataset = await Apify.openDataset();
 
+    // Crawler configuration
     const crawler = new Apify.PuppeteerCrawler({
-        requestList,
         requestQueue,
         proxyConfiguration,
         launchContext: {
-            useChrome: true,
+            useIncognitoPages: true,
             stealth: true,
         },
-        handlePageFunction: async ({ request, page }) => {
-            const listings = await page.$$eval('.listing', (nodes) => {
-                return nodes.map((node) => ({
-                    url: node.querySelector('a').href,
-                    title: node.querySelector('h2').textContent.trim(),
-                    price: node.querySelector('.price').textContent.trim(),
-                    location: node.querySelector('.location').textContent.trim(),
-                }));
-            });
+        handlePageFunction: async ({ page, request }) => {
+            await Apify.utils.puppeteer.injectJQuery(page);
 
-            if (includeDetails) {
-                for (const listing of listings) {
+            if (request.userData.label === 'LISTING') {
+                // Extract details from the listing page
+                const data = await page.evaluate(() => {
+                    const title = $('h1').text().trim();
+                    const price = $('.price').text().trim();
+                    const location = $('.location').text().trim();
+                    const bedrooms = $('.bedrooms').text().trim();
+                    const bathrooms = $('.bathrooms').text().trim();
+                    const squareFootage = $('.square-footage').text().trim();
+                    const description = $('.description').text().trim();
+                    const images = $('.gallery img').map((_, img) => $(img).attr('src')).get();
+                    const agentInfo = {
+                        name: $('.agent-name').text().trim(),
+                        phone: $('.agent-phone').text().trim(),
+                        email: $('.agent-email').text().trim(),
+                    };
+                    const datePosted = $('.date-posted').text().trim();
+
+                    return {
+                        title,
+                        price,
+                        location,
+                        bedrooms,
+                        bathrooms,
+                        squareFootage,
+                        description,
+                        images,
+                        agentInfo,
+                        url: request.url,
+                        datePosted,
+                    };
+                });
+
+                // Store the listing data
+                await dataset.pushData(data);
+            } else {
+                // Extract listing URLs from the search results page
+                const listingUrls = await page.$$eval('.listing-item a', (links) =>
+                    links.map((link) => link.href)
+                );
+
+                // Enqueue listing URLs for further crawling
+                for (const url of listingUrls) {
                     await requestQueue.addRequest({
-                        url: listing.url,
-                        userData: listing,
+                        url,
+                        userData: { label: 'LISTING' },
                     });
                 }
-            } else {
-                await Apify.pushData(listings);
-            }
 
-            if (await page.$('.next-page')) {
-                await requestQueue.addRequest({
-                    url: await page.$eval('.next-page', (el) => el.href),
-                    userData: { label: 'PAGINATION' },
-                });
+                // Check for pagination and enqueue next page URL
+                const nextPageUrl = await page.$eval('.pagination a.next', (link) => link.href);
+                if (nextPageUrl) {
+                    await requestQueue.addRequest({ url: nextPageUrl });
+                }
             }
         },
-        handleFailedRequestFunction: async ({ request }) => {
-            log.warning(`Request ${request.url} failed. Retrying...`);
-            await Apify.utils.sleep(1000);
-            return request;
-        },
-        maxRequestRetries: 3,
         maxRequestsPerCrawl: maxListings,
     });
 
-    crawler.on('handleRequestFunction', async ({ request, page }) => {
-        if (!request.userData.label) {
-            log.info(`Scraping listing detail page: ${request.url}`);
-
-            const listingData = await page.evaluate(() => {
-                const details = {};
-                details.bedrooms = document.querySelector('.bedrooms').textContent.trim();
-                details.bathrooms = document.querySelector('.bathrooms').textContent.trim();
-                details.sqft = document.querySelector('.sqft').textContent.trim();
-                details.description = document.querySelector('.description').textContent.trim();
-                details.images = [...document.querySelectorAll('.images img')].map((img) => img.src);
-                details.agent = document.querySelector('.agent-info').textContent.trim();
-                details.postedDate = document.querySelector('.posted-date').textContent.trim();
-                return details;
-            });
-
-            await Apify.pushData({ ...request.userData, ...listingData });
-        }
-    });
-
-    log.info('Starting the crawl...');
+    // Run the crawler
     await crawler.run();
-    log.info('Crawl finished.');
+
+    console.log('Scraping completed.');
 });
