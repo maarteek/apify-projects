@@ -1,5 +1,7 @@
 const Apify = require('apify');
-const { URL } = require('url');
+const { puppeteer } = require('puppeteer-extra');
+const proxyChain = require('proxy-chain');
+const { log } = Apify.utils;
 
 const { utils: { log } } = Apify;
 
@@ -12,116 +14,87 @@ Apify.main(async () => {
         proxy = { useApifyProxy: true },
     } = input;
 
+    const proxyConfiguration = await proxyChain.resolveProxyConfiguration(proxy);
+
+    // Initialize Puppeteer browser with proxy
+    const browser = await puppeteer.launch({
+        args: [...proxyChain.createProxyArgs(proxyConfiguration)],
+    });
+
     const requestQueue = await Apify.openRequestQueue();
     await requestQueue.addRequest({
         url: `https://www.example.com/search?q=${encodeURIComponent(searchQuery)}`,
         userData: { label: 'SEARCH' },
     });
 
-    const proxyConfiguration = await Apify.createProxyConfiguration(proxy);
-
     const crawler = new Apify.PuppeteerCrawler({
         requestQueue,
         proxyConfiguration,
         launchContext: {
             useChrome: true,
-            launchOptions: {
-                headless: true,
-            },
+            stealth: true,
         },
         handlePageFunction: async ({ request, page }) => {
             const label = request.userData.label;
 
             if (label === 'SEARCH') {
-                log.info(`Processing search results page: ${request.url}`);
-
-                // Scrape listing URLs from the search results page
-                const listingUrls = await page.$$eval('.listing-item > a', (links) =>
-                    links.map((link) => link.href)
+                log.info('Searching for listings...');
+                const listingUrls = await page.$$eval('.listing-link', (links) => 
+                    links.map((link) => link.href).slice(0, maxListings)
                 );
 
-                // Enqueue listing URLs for further processing
                 for (const url of listingUrls) {
                     await requestQueue.addRequest({
                         url,
                         userData: { label: 'LISTING' },
-                    });
+                    }, { forefront: true });
                 }
 
-                // Check if there are more search result pages
-                const nextPageUrl = await page.$eval('.pagination a.next', (el) => el.href);
+                // Check for next page
+                const nextPageUrl = await page.$eval('.pagination-next', (el) => el.href);
                 if (nextPageUrl) {
                     await requestQueue.addRequest({
-                        url: new URL(nextPageUrl, request.url).href,
+                        url: nextPageUrl,
                         userData: { label: 'SEARCH' },
                     });
                 }
-            } else if (label === 'LISTING') {
-                log.info(`Processing listing page: ${request.url}`);
+            }
 
-                // Scrape listing details
+            if (label === 'LISTING') {
                 const listing = await page.evaluate(() => {
                     const titleEl = document.querySelector('h1');
                     const priceEl = document.querySelector('.price');
                     const addressEl = document.querySelector('.address');
-                    const detailsEl = document.querySelector('.property-details');
+                    const detailsEl = document.querySelector('.details');
                     const descriptionEl = document.querySelector('.description');
                     const imageEls = document.querySelectorAll('.gallery img');
                     const agentEl = document.querySelector('.agent-info');
+                    const dateEl = document.querySelector('.listing-date');
 
                     return {
-                        title: titleEl ? titleEl.innerText.trim() : null,
-                        price: priceEl ? priceEl.innerText.trim() : null,
-                        location: addressEl ? addressEl.innerText.trim() : null,
-                        details: detailsEl ? detailsEl.innerText.trim() : null,
-                        description: descriptionEl ? descriptionEl.innerText.trim() : null,
-                        images: Array.from(imageEls).map((img) => img.src),
-                        agent: agentEl ? agentEl.innerText.trim() : null,
-                        url: request.url,
-                        postedDate: null,
+                        title: titleEl && titleEl.textContent.trim(),
+                        price: priceEl && priceEl.textContent.trim(),
+                        location: addressEl && addressEl.textContent.trim(),
+                        details: detailsEl && detailsEl.textContent.trim(),
+                        description: descriptionEl && descriptionEl.textContent.trim(),
+                        images: [...imageEls].map((img) => img.src),
+                        agent: agentEl && agentEl.textContent.trim(),
+                        url: window.location.href,
+                        datePosted: dateEl && dateEl.textContent.trim(),
                     };
                 });
 
-                // Extract property details
-                if (listing.details) {
-                    const detailsRegex = /(\d+)\s+bed.*?(\d+)\s+bath.*?(\d+)\s+sqft/i;
-                    const match = listing.details.match(detailsRegex);
-                    if (match) {
-                        listing.bedrooms = parseInt(match[1], 10);
-                        listing.bathrooms = parseInt(match[2], 10);
-                        listing.squareFootage = parseInt(match[3], 10);
-                    }
-                }
-
-                // Extract location details
-                if (listing.location) {
-                    const addressParts = listing.location.split(',').map((part) => part.trim());
-                    listing.address = addressParts[0] || null;
-                    listing.city = addressParts[1] || null;
-                    listing.postalCode = addressParts[2] || null;
-                    delete listing.location;
-                }
-
-                // Cleanup agent info
-                if (listing.agent) {
-                    listing.agent = listing.agent.replace(/\s+/g, ' ');
-                }
-
-                // Extract date posted if available
-                const datePostedEl = await page.$('.date-posted');
-                if (datePostedEl) {
-                    listing.postedDate = await page.evaluate(
-                        (el) => el.innerText.trim(),
-                        datePostedEl
-                    );
-                }
-
+                log.info(`Scraped listing: ${listing.title}`);
                 await Apify.pushData(listing);
             }
         },
-        maxRequestsPerCrawl: maxListings,
+        handleFailedRequestFunction: async ({ request }) => {
+            log.error(`Request ${request.url} failed too many times`);
+        },
     });
 
+    log.info('Starting the crawl...');
     await crawler.run();
-    log.info('Scraping finished.');
+    log.info('Crawl finished.');
+    await browser.close();
 });
