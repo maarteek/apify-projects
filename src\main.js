@@ -7,82 +7,87 @@ Apify.main(async () => {
         searchQuery = '',
         maxListings = 50,
         includeDetails = true,
-        proxy = { useApifyProxy: true },
+        proxy,
     } = input;
 
     const requestQueue = await Apify.openRequestQueue();
     await requestQueue.addRequest({
         url: `https://www.example.com/search?q=${encodeURIComponent(searchQuery)}`,
+        userData: { label: 'SEARCH' },
     });
+
+    const proxyConfiguration = await Apify.createProxyConfiguration(proxy);
 
     const crawler = new Apify.PuppeteerCrawler({
         requestQueue,
-        proxyConfiguration: proxy,
+        proxyConfiguration,
         launchContext: {
             useChrome: true,
             stealth: true,
         },
-        handlePageFunction: async ({ page, request }) => {
-            // Wait for search results to load
-            await page.waitForSelector('.search-results');
+        handlePageFunction: async ({ request, page }) => {
+            const { label } = request.userData;
 
-            // Extract listing URLs from search results
-            const listingUrls = await page.$$eval('.listing-item a', (links) =>
-                links.map((link) => link.href)
-            );
+            if (label === 'SEARCH') {
+                log.info('Scraping search results');
+                const listings = await page.$$eval('.listing-item', (nodes) =>
+                    nodes.map((node) => ({
+                        url: node.querySelector('a').href,
+                        title: node.querySelector('.listing-title').textContent.trim(),
+                        price: node.querySelector('.listing-price').textContent.trim(),
+                        location: node.querySelector('.listing-location').textContent.trim(),
+                    }))
+                );
 
-            // Enqueue listing pages for detail scraping
-            if (includeDetails) {
-                for (const url of listingUrls) {
-                    await requestQueue.addRequest({ url, userData: { label: 'DETAIL' } });
+                for (const listing of listings) {
+                    if (await requestQueue.getInfo().requestsCount >= maxListings) break;
+                    await requestQueue.addRequest({
+                        url: listing.url,
+                        userData: { label: 'LISTING', ...listing },
+                    });
                 }
+
+                const nextPageUrl = await page.$eval('.pagination a.next', (el) => el.href);
+                if (nextPageUrl && (await requestQueue.getInfo().requestsCount < maxListings)) {
+                    await requestQueue.addRequest({
+                        url: nextPageUrl,
+                        userData: { label: 'SEARCH' },
+                    });
+                }
+            } else if (label === 'LISTING' && includeDetails) {
+                log.info(`Scraping listing details: ${request.url}`);
+                const { title, price, location } = request.userData;
+                const details = await page.evaluate(() => ({
+                    bedrooms: document.querySelector('.listing-bedrooms')?.textContent.trim(),
+                    bathrooms: document.querySelector('.listing-bathrooms')?.textContent.trim(),
+                    size: document.querySelector('.listing-size')?.textContent.trim(),
+                    description: document.querySelector('.listing-description')?.textContent.trim(),
+                    images: Array.from(document.querySelectorAll('.listing-images img')).map((img) => img.src),
+                    agent: {
+                        name: document.querySelector('.listing-agent-name')?.textContent.trim(),
+                        phone: document.querySelector('.listing-agent-phone')?.textContent.trim(),
+                        email: document.querySelector('.listing-agent-email')?.textContent.trim(),
+                    },
+                    postedDate: document.querySelector('.listing-posted-date')?.textContent.trim(),
+                }));
+
+                await Apify.pushData({
+                    url: request.url,
+                    title,
+                    price,
+                    location,
+                    ...details,
+                });
             }
-
-            // Extract listing data from search results page
-            const listings = await extractListings(page);
-            log.info(`Extracted ${listings.length} listings from ${request.url}`);
-
-            // Check if there are more pages and enqueue next page URL
-            const nextPageUrl = await getNextPageUrl(page);
-            if (nextPageUrl && listings.length < maxListings) {
-                await requestQueue.addRequest({ url: nextPageUrl });
-            }
-
-            // Push listings to dataset
-            await Apify.pushData(listings);
         },
         handleFailedRequestFunction: async ({ request }) => {
-            log.warning(`Request ${request.url} failed. Retrying...`);
-            await Apify.utils.sleep(1000);
+            log.warning(`Request failed: ${request.url}. Retrying...`);
+            await Apify.utils.sleep(1000); // Wait a second before retrying
             await requestQueue.addRequest(request);
         },
     });
 
-    // Set up separate handler for listing detail pages
-    crawler.on('handleRequestFunction', async ({ request, page }) => {
-        if (request.userData.label === 'DETAIL') {
-            const listingData = await extractListingDetails(page);
-            log.info(`Extracted details for ${request.url}`);
-            await Apify.pushData(listingData);
-        }
-    });
-
+    log.info('Starting the crawl...');
     await crawler.run();
-
-    async function extractListings(page) {
-        // Extract listing data from search results page
-        // Implement logic to extract title, price, location, etc.
-        // Return an array of listing objects
-    }
-
-    async function extractListingDetails(page) {
-        // Extract detailed data from individual listing page
-        // Implement logic to extract description, images, agent info, etc.
-        // Return a listing object with detailed information
-    }
-
-    async function getNextPageUrl(page) {
-        // Check if there is a next page URL
-        // Return the URL if found, otherwise return null
-    }
+    log.info('Crawl finished.');
 });
