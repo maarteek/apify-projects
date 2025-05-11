@@ -1,130 +1,111 @@
 const Apify = require('apify');
-const { RequestQueue, Dataset } = Apify.default;
+const { log } = Apify.utils;
 
 Apify.main(async () => {
-    // Define input schema
-    const input = await Apify.getInput({
-        schema: {
-            searchQuery: {
-                type: 'string',
-                description: 'Text to search for (e.g., "apartments in London")',
-                default: 'apartments in London',
-            },
-            maxListings: {
-                type: 'integer',
-                description: 'Maximum number of listings to scrape',
-                default: 50,
-            },
-            includeDetails: {
-                type: 'boolean',
-                description: 'Determine if detailed page info should be scraped',
-                default: true,
-            },
-            proxy: {
-                type: 'object',
-                description: 'Proxy configuration object',
-            },
-        },
-    });
+    const input = await Apify.getInput();
+    const {
+        searchQuery = '',
+        maxListings = 50,
+        includeDetails = true,
+        proxy = { useApifyProxy: true },
+    } = input;
 
-    const { searchQuery, maxListings, includeDetails, proxy } = input;
-
-    // Initialize request queue and dataset
-    const requestQueue = await RequestQueue.open();
-    const dataset = await Dataset.open();
-
-    // Add search page URL to the request queue
+    const requestQueue = await Apify.openRequestQueue();
     await requestQueue.addRequest({
         url: `https://www.propertywebsite.com/search?q=${encodeURIComponent(searchQuery)}`,
         userData: { label: 'SEARCH' },
     });
 
-    // Create a crawler
     const crawler = new Apify.PuppeteerCrawler({
         requestQueue,
         proxyConfiguration: proxy,
         launchContext: {
             useChrome: true,
-            stealth: true,
             launchOptions: {
                 headless: true,
             },
         },
-        handlePageFunction: async ({ page, request }) => {
+        handlePageFunction: async ({ request, page }) => {
             const label = request.userData.label;
 
-            // Extract data from the listing page
-            if (label === 'LISTING') {
-                const data = await extractListingData(page);
-                await dataset.pushData(data);
-                return;
-            }
+            if (label === 'SEARCH') {
+                log.info('Scraping search results...');
+                const listings = await page.$$eval('.listing-item', (nodes) => {
+                    return nodes.map((node) => ({
+                        url: node.querySelector('a').href,
+                        title: node.querySelector('h3').textContent.trim(),
+                        price: node.querySelector('.price').textContent.trim(),
+                        location: node.querySelector('.location').textContent.trim(),
+                    }));
+                });
 
-            // Extract data from the search results page
-            const listings = await page.$$('.listing-item');
-
-            for (const [index, listing] of listings.entries()) {
-                if (index >= maxListings) break;
-
-                const url = await listing.$eval('a', (el) => el.href);
-
-                if (includeDetails) {
+                for (const listing of listings) {
+                    if (await requestQueue.getCount() >= maxListings) {
+                        break;
+                    }
                     await requestQueue.addRequest({
-                        url,
-                        userData: { label: 'LISTING' },
+                        url: listing.url,
+                        userData: { label: 'DETAIL', ...listing },
                     });
-                } else {
-                    const data = await extractListingSummary(listing);
-                    data.url = url;
-                    await dataset.pushData(data);
                 }
-            }
 
-            // Handle pagination
-            const nextPageUrl = await page.$eval('.next-page', (el) => el.href);
-            if (nextPageUrl) {
-                await requestQueue.addRequest({
-                    url: nextPageUrl,
-                    userData: { label: 'SEARCH' },
+                // Handle pagination
+                const nextButton = await page.$('.next-page');
+                if (nextButton && (await requestQueue.getCount()) < maxListings) {
+                    await nextButton.click();
+                    await page.waitForSelector('.listing-item');
+                    await Apify.utils.enqueueLinks({
+                        page,
+                        requestQueue,
+                        selector: '.next-page',
+                        transformRequestFunction: (req) => ({
+                            ...req,
+                            userData: { label: 'SEARCH' },
+                        }),
+                    });
+                }
+            } else if (label === 'DETAIL' && includeDetails) {
+                log.info(`Scraping details for ${request.userData.url}`);
+                const { url, title, price, location } = request.userData;
+
+                const details = await page.evaluate(() => {
+                    const description = document.querySelector('.description').textContent.trim();
+                    const images = Array.from(document.querySelectorAll('.gallery img')).map((img) => img.src);
+                    const agent = document.querySelector('.agent-info').textContent.trim();
+                    const datePosted = document.querySelector('.date-posted').textContent.trim();
+                    const bedrooms = document.querySelector('.bedrooms').textContent.trim();
+                    const bathrooms = document.querySelector('.bathrooms').textContent.trim();
+                    const squareFootage = document.querySelector('.sq-footage').textContent.trim();
+
+                    return {
+                        description,
+                        images,
+                        agent,
+                        datePosted,
+                        bedrooms,
+                        bathrooms,
+                        squareFootage,
+                    };
+                });
+
+                await Apify.pushData({
+                    url,
+                    title,
+                    price,
+                    location,
+                    ...details,
                 });
             }
         },
 
         handleFailedRequestFunction: async ({ request }) => {
-            Apify.utils.log.error(`Request ${request.url} failed too many times`, request);
+            log.warning(`Request ${request.url} failed. Retrying...`);
+            await Apify.utils.sleep(1000);
+            return request;
         },
     });
 
-    // Start the crawler
+    log.info('Starting the crawl...');
     await crawler.run();
-
-    Apify.utils.log.info('Scraping finished.');
+    log.info('Crawl finished.');
 });
-
-async function extractListingData(page) {
-    // Extract detailed listing data from the listing page
-    const data = {};
-
-    data.title = await page.$eval('h1', (el) => el.textContent.trim());
-    data.price = await page.$eval('.price', (el) => el.textContent.trim());
-    data.location = await page.$eval('.location', (el) => el.textContent.trim());
-    data.details = await page.$eval('.details', (el) => el.textContent.trim());
-    data.description = await page.$eval('.description', (el) => el.textContent.trim());
-    data.images = await page.$$eval('img', (els) => els.map((el) => el.src));
-    data.agent = await page.$eval('.agent', (el) => el.textContent.trim());
-    data.url = page.url();
-    data.postedDate = await page.$eval('.posted-date', (el) => el.textContent.trim());
-
-    return data;
-}
-
-async function extractListingSummary(listing) {
-    // Extract summary data from the listing element on the search results page
-    const data = {};
-
-    data.title = await listing.$eval('.title', (el) => el.textContent.trim());
-    data.price = await listing.$eval('.price', (el) => el.textContent.trim());
-    data.location = await listing.$eval('.location', (el) => el.textContent.trim());
-
-    return data;
-}
