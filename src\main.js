@@ -1,5 +1,6 @@
+// main.js
 const Apify = require('apify');
-const { puppet } = Apify.utils;
+const { log } = Apify.utils;
 
 Apify.main(async () => {
     const input = await Apify.getInput();
@@ -21,102 +22,64 @@ Apify.main(async () => {
     const crawler = new Apify.PuppeteerCrawler({
         requestQueue,
         proxyConfiguration,
-        launchContext: {
-            useChrome: true,
-            stealth: true,
-            launchOptions: {
-                headless: true,
-            },
-        },
+        useSessionPool: true,
+        persistCookiesPerSession: true,
+        maxRequestRetries: 3,
         handlePageFunction: async ({ request, page }) => {
             const label = request.userData.label;
 
             if (label === 'SEARCH') {
-                log.info(`Navigating to search results page: ${request.url}`);
-                await puppet.injectJQuery(page);
+                // Handle search results page
+                log.info(`Processing search results for query: ${searchQuery}`);
 
-                // Click on consent dialog if present
-                try {
-                    await puppet.clickIfExists(page, '#consent-button');
-                } catch (e) {
-                    log.debug('Consent dialog not found');
+                const listings = await page.$$eval('.listing-card', (nodes) =>
+                    nodes.map((node) => ({
+                        url: node.querySelector('a').href,
+                        title: node.querySelector('h3').textContent.trim(),
+                        price: node.querySelector('.listing-price').textContent.trim(),
+                        location: node.querySelector('.listing-location').textContent.trim(),
+                    }))
+                );
+
+                for (const listing of listings) {
+                    if (includeDetails) {
+                        await requestQueue.addRequest({
+                            url: listing.url,
+                            userData: { label: 'DETAIL', listing },
+                        }, { forefront: true });
+                    } else {
+                        await Apify.pushData(listing);
+                    }
                 }
 
-                // Extract listing URLs from search results
-                const listingUrls = await page.evaluate(() => {
-                    return $('.listing-item > a').map((_, el) => $(el).attr('href')).get();
-                });
-
-                // Enqueue listing URLs for scraping
-                for (const url of listingUrls.slice(0, maxListings)) {
+                // Pagination
+                if (await page.$('.next-page')) {
                     await requestQueue.addRequest({
-                        url: new URL(url, request.url).href,
-                        userData: { label: 'LISTING' },
-                    }, { forefront: true });
-                }
-
-                // Enqueue next page URL if available and under maxListings limit
-                const nextPageUrl = await page.$eval('.next-page', el => el.href);
-                if (nextPageUrl && (await requestQueue.getInfo()).pendingRequestCount < maxListings) {
-                    await requestQueue.addRequest({
-                        url: new URL(nextPageUrl, request.url).href,
+                        url: await page.$eval('.next-page', (el) => el.href),
                         userData: { label: 'SEARCH' },
                     });
                 }
-            } else if (label === 'LISTING') {
-                log.info(`Scraping listing details: ${request.url}`);
-                await puppet.injectJQuery(page);
+            } else if (label === 'DETAIL') {
+                // Handle detail page
+                log.info(`Processing detail page for listing: ${request.userData.listing.title}`);
 
-                // Extract listing details
-                const listingData = await page.evaluate(() => {
-                    const data = {};
+                const { listing } = request.userData;
 
-                    data.title = $('h1.listing-title').text().trim();
-                    data.price = $('span.listing-price').text().trim();
-                    data.location = {
-                        address: $('span.listing-address').text().trim(), 
-                        city: $('span.listing-city').text().trim(),
-                        postalCode: $('span.listing-postal').text().trim(),
-                    };
+                listing.description = await page.$eval('.listing-description', (el) => el.textContent.trim());
+                listing.details = await page.$eval('.listing-details', (el) => el.textContent.trim());
+                listing.images = await page.$$eval('.listing-images img', (nodes) => nodes.map((img) => img.src));
+                listing.agent = await page.$eval('.listing-agent', (el) => el.textContent.trim());
+                listing.datePosted = await page.$eval('.listing-date', (el) => el.textContent.trim());
 
-                    const details = $('ul.listing-details > li').map((_, el) => $(el).text().trim()).get();
-                    data.details = {
-                        bedrooms: details.find(d => d.includes('bed'))?.match(/(\d+)/)?.[1],
-                        bathrooms: details.find(d => d.includes('bath'))?.match(/(\d+)/)?.[1],
-                        sqft: details.find(d => d.toLowerCase().includes('sqft'))?.match(/(\d+)/)?.[1],
-                    };
-
-                    data.description = $('p.listing-description').text().trim();
-                    
-                    data.images = $('img.listing-image').map((_, el) => $(el).attr('src')).get();
-
-                    const agentEl = $('div.listing-agent');
-                    data.agent = {
-                        name: agentEl.find('h3').text().trim(),
-                        phone: agentEl.find('span.phone').text().trim(),
-                        email: agentEl.find('span.email').text().trim(),
-                    };
-
-                    data.url = window.location.href;
-                    data.postedDate = $('span.listing-posted-date').text().trim();
-
-                    return data;
-                });
-
-                await Apify.pushData(listingData);
+                await Apify.pushData(listing);
             }
         },
         handleFailedRequestFunction: async ({ request }) => {
-            log.warning(`Request failed after ${request.retryCount} retries`, { url: request.url });
-            await Apify.pushData({
-                '#isFailed': true,
-                '#failedRequestUrl': request.url,
-                '#failedRequestDetails': request,
-            });
+            log.error(`Request ${request.url} failed too many times`);
         },
     });
 
     log.info('Starting the crawl...');
     await crawler.run();
-    log.info('Crawl finished!');
+    log.info('Crawl finished.');
 });
