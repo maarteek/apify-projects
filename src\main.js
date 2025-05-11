@@ -1,7 +1,5 @@
 const Apify = require('apify');
-const {
-    utils: { log },
-} = Apify;
+const { log } = Apify.utils;
 
 Apify.main(async () => {
     const input = await Apify.getInput();
@@ -9,13 +7,13 @@ Apify.main(async () => {
         searchQuery = '',
         maxListings = 50,
         includeDetails = true,
-        proxy,
+        proxy = { useApifyProxy: true },
     } = input;
 
     const requestQueue = await Apify.openRequestQueue();
     await requestQueue.addRequest({
         url: `https://www.example.com/search?q=${encodeURIComponent(searchQuery)}`,
-        userData: { label: 'START' },
+        userData: { label: 'SEARCH' },
     });
 
     const proxyConfiguration = await Apify.createProxyConfiguration(proxy);
@@ -25,6 +23,7 @@ Apify.main(async () => {
         proxyConfiguration,
         launchContext: {
             useChrome: true,
+            stealth: true,
             launchOptions: {
                 headless: true,
             },
@@ -32,18 +31,20 @@ Apify.main(async () => {
         handlePageFunction: async ({ request, page }) => {
             const label = request.userData.label;
 
-            if (label === 'START') {
-                log.info('Searching for listings...');
-                const listings = await page.$$eval('.listing-item', (items) =>
-                    items.map((item) => ({
-                        url: item.querySelector('a').href,
-                        title: item.querySelector('.listing-title').textContent.trim(),
-                        price: item.querySelector('.listing-price').textContent.trim(),
-                        location: item.querySelector('.listing-location').textContent.trim(),
-                    }))
-                );
+            if (label === 'SEARCH') {
+                log.info(`Searching for "${searchQuery}"`);
+                await page.waitForSelector('.listing-item');
 
-                for (const listing of listings.slice(0, maxListings)) {
+                const listings = await page.$$eval('.listing-item', (nodes) => {
+                    return nodes.map((node) => ({
+                        url: node.querySelector('a').href,
+                        title: node.querySelector('h3').textContent.trim(),
+                        price: node.querySelector('.price').textContent.trim(),
+                        location: node.querySelector('.location').textContent.trim(),
+                    }));
+                });
+
+                for (const listing of listings) {
                     if (includeDetails) {
                         await requestQueue.addRequest({
                             url: listing.url,
@@ -54,37 +55,47 @@ Apify.main(async () => {
                     }
                 }
 
-                // Navigate to the next page
-                const nextButton = await page.$('.next-page');
-                if (nextButton) {
-                    await nextButton.click();
-                    await page.waitForNavigation();
+                const nextButtonDisabled = await page.$eval('.next-button', (el) => el.disabled);
+                if (maxListings > listings.length && !nextButtonDisabled) {
                     await requestQueue.addRequest({
-                        url: page.url(),
-                        userData: { label: 'START' },
+                        url: await page.$eval('.next-button', (el) => el.href),
+                        userData: { label: 'SEARCH' },
                     });
                 }
             } else if (label === 'DETAIL') {
-                log.info(`Scraping details for listing: ${request.userData.listing.url}`);
-                const { listing } = request.userData;
+                log.info(`Scraping details for "${request.userData.listing.title}"`);
+                await page.waitForSelector('.listing-details');
 
-                listing.description = await page.$eval('.listing-description', (el) => el.textContent.trim());
-                listing.details = await page.$eval('.listing-details', (el) => el.textContent.trim());
-                listing.images = await page.$$eval('.listing-image', (imgs) => imgs.map((img) => img.src));
-                listing.agent = await page.$eval('.listing-agent', (el) => el.textContent.trim());
-                listing.postedDate = await page.$eval('.listing-posted-date', (el) => el.textContent.trim());
+                const details = await page.evaluate(() => {
+                    const propertyDetails = {};
+                    const detailNodes = document.querySelectorAll('.listing-details li');
+                    detailNodes.forEach((node) => {
+                        const [key, value] = node.textContent.trim().split(':');
+                        propertyDetails[key.trim()] = value.trim();
+                    });
 
-                await Apify.pushData(listing);
+                    return {
+                        description: document.querySelector('.description').textContent.trim(),
+                        images: Array.from(document.querySelectorAll('.gallery img')).map((img) => img.src),
+                        agent: document.querySelector('.agent-name').textContent.trim(),
+                        contactInfo: document.querySelector('.agent-contact').textContent.trim(),
+                        datePosted: document.querySelector('.date-posted').textContent.trim(),
+                        propertyDetails,
+                    };
+                });
+
+                await Apify.pushData({ ...request.userData.listing, ...details });
             }
         },
         handleFailedRequestFunction: async ({ request }) => {
-            log.warning(`Request ${request.url} failed. Retrying...`);
+            log.warning(`Request ${request.url} failed, retrying...`);
             await Apify.utils.sleep(1000);
             await requestQueue.addRequest(request);
         },
     });
 
-    log.info('Starting the crawl...');
+    log.info('Starting the crawler.');
     await crawler.run();
-    log.info('Crawl finished.');
+
+    log.info('Crawler finished.');
 });
